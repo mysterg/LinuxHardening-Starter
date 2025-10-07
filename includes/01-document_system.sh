@@ -1,42 +1,99 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# 01-document_system.sh
+# Collects baseline system information for later comparison.
+# Designed to be *sourced* by a menu script (e.g., harden.sh).
+# Strict mode is enabled only when executed directly.
 
-# Document the system before making changes.
+# Enable strict mode only when run directly, not when sourced
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  set -euo pipefail
+fi
 
-invoke_document_system () {
-echo "Running Documenting System..."
-# Placeholder for Documenting System functionality
+invoke_document_system() {
+  echo "Running Documenting System..."
 
-# Create directory for storing documentation if it doesn't exist
-mkdir -p "$DOCS"
-    
-# Get a list of all usernames on the system
-cut -d: -f1 /etc/passwd > "$DOCS/users.txt"
+  # Resolve output directory (caller can export DOCS; else default)
+  local outdir
+  outdir="${DOCS:-/root/system-docs}"
+  mkdir -p "$outdir" || true
 
-# Get a list of all users in the sudo group
-getent group sudo | cut -d: -f4 | tr ',' '\n' > "$DOCS/admins.txt"
+  # 1) Users and admin groups
+  cut -d: -f1 /etc/passwd > "$outdir/users.txt" 2>/dev/null || true
+  { getent group sudo 2>/dev/null || true; getent group wheel 2>/dev/null || true; } > "$outdir/admin_groups.txt"
 
-# Get a list of all apt packages installed
-dpkg --get-selections | awk '{print $1}' > "$DOCS/packages.txt"
+  # 2) Package inventories (Debian/Ubuntu, RPM, Snap, Flatpak)
+  if command -v dpkg >/dev/null 2>&1;   then dpkg -l   > "$outdir/packages_dpkg.txt"   2>/dev/null || true; fi
+  if command -v rpm  >/dev/null 2>&1;   then rpm -qa    > "$outdir/packages_rpm.txt"    2>/dev/null || true; fi
+  if command -v snap >/dev/null 2>&1;   then snap list  > "$outdir/snap.txt"            2>/dev/null || true; fi
+  if command -v flatpak >/dev/null 2>&1;then flatpak list > "$outdir/flatpak.txt"       2>/dev/null || true; fi
 
-# Get a list of all snap packages installed
-snap list > "$DOCS/snap.txt"
+  # 3) Listening sockets and associated processes
+  if command -v ss >/dev/null 2>&1; then
+    ss -plnt > "$outdir/ss_plnt.txt" 2>/dev/null || true
 
-# Get a list of all listening services
-ss -plnt > "$DOCS/listening.txt"
+    # Extract unique process names from users:(("proc","pid=..."))
+    awk 'NR>1{print $0}' "$outdir/ss_plnt.txt" 2>/dev/null \
+      | grep -oE 'users:\(\(.*\)\)' 2>/dev/null \
+      | sed 's/users:(('//;s/))//' 2>/dev/null \
+      | tr ',' '\n' \
+      | sed -E 's/.*"([^"]+)".*/\1/' \
+      | sort -u > "$outdir/listening_services.txt" 2>/dev/null || true
 
-# Get a refined list of services that are listening for clients and store it in listening_services.txt
-ss -plnt | awk 'NR>1 {print $NF}' | awk -F, '{print $1}' | sort | uniq | grep -oP '"\K[^"]+' > "$DOCS/listening_services.txt"
-	
-# Document all cron jobs
-for user in $(cut -f1 -d: /etc/passwd); do echo "Cron jobs for user: $user" >> "$DOCS/cron.txt"; crontab -u $user -l >> "$DOCS/cron.txt" 2>/dev/null; echo "" >> "$DOCS/cron.txt"; done
+    # Pre-malware detail: for each listening PID, capture exe/cmdline
+    : > "$outdir/premalware.txt"
+    grep -oE 'pid=[0-9]+' "$outdir/ss_plnt.txt" 2>/dev/null \
+      | cut -d= -f2 \
+      | sort -u \
+      | while read -r pid; do
+          [[ -n "$pid" ]] || continue
+          exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+          cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+          comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+          {
+            echo "PID: $pid"
+            echo "  Command: $comm"
+            echo "  Executable: $exe"
+            echo "  Cmdline: $cmdline"
+            echo
+          } >> "$outdir/premalware.txt"
+        done
+  fi
 
-# Get system-wide cron jobs
-cat /etc/crontab /etc/cron.d/* >> "$DOCS/cron.txt"
+  # 4) Cron documentation (user and system)
+  : > "$outdir/cron.txt"
+  cut -f1 -d: /etc/passwd | while read -r u; do
+    {
+      echo "Cron jobs for user: $u"
+      crontab -u "$u" -l 2>/dev/null || true
+      echo
+    } >> "$outdir/cron.txt"
+  done
+  {
+    echo "=== /etc/crontab ==="
+    cat /etc/crontab 2>/dev/null || true
+    echo
+    echo "=== /etc/cron.d/* ==="
+    cat /etc/cron.d/* 2>/dev/null || true
+  } >> "$outdir/cron.txt"
 
-# Listening Malware Search
-for pid in $(sudo ss -plnt | grep -oP 'pid=\K\d+' | sort -u); do cmdline=$(tr -d '\0' < /proc/$pid/cmdline 2>/dev/null); if [ -n "$cmdline" ]; then echo "PID: $pid - Command Line: $cmdline" >> "$DOCS/premalware.txt"; fi; done
+  # 5) Compare current packages to a VANILLA baseline, if provided
+  # Expect caller to set:
+  #   CURDPKG  -> whitespace-separated list of current packages
+  #   VANILLA  -> baseline list/concatenation to compare against
+  if [[ -n "${CURDPKG:-}" && -n "${VANILLA:-}" ]]; then
+    : > "$outdir/suspackages.txt"
+    for I in ${CURDPKG:-}; do
+      if [[ "${VANILLA:-}" != *"$I"* ]]; then
+        echo "$I" >> "$outdir/suspackages.txt"
+      fi
+    done
+  fi
 
-# Comapare Vanilla Packages to Installed Packages
-for I in $CURDPKG; do if [[ $VANILLA != *"$I"* ]]; then echo $I >> $DOCS/suspackages.txt; fi; done
+  echo "Documentation written to: $outdir"
+  return 0
 }
+
+# If executed directly, run the function immediately.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  invoke_document_system
+fi
