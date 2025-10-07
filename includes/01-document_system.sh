@@ -1,4 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Document the system before making changes.
+
 invoke_document_system () {
 echo "Running Documenting System..."
 # Placeholder for Documenting System functionality
